@@ -1,4 +1,4 @@
-# Aurum Contra Oleum — BU423 Hedge Fund Options Bot
+# BU423 Hedge Fund Commodities Options Bot
 
 > Automated options trading bot for the BU423 Hedge Fund Options Challenge.
 > Connects to IBKR Paper Trading via TWS API. Local execution with Streamlit dashboard.
@@ -100,4 +100,3 @@ aurum-contra-oleum/
 - **IBKR paper trading uses simulated fills** — real spreads may differ.
 - **All positions must be closed by April 3, 2026 EOD.**
 - **Take IBKR screenshots** of every trade confirmation for the journal.
-- **AI usage disclosure:** Per BU423 policy, cite Claude/Anthropic in your report.
