@@ -81,9 +81,14 @@ class TradingBot:
                 clientId=config.CLIENT_ID,
                 timeout=15,
             )
+            # CRITICAL: Paper trading doesn't have live market data subscriptions.
+            # Type 3 = delayed data (15-min delay, free)
+            # Type 4 = delayed-frozen (last available price even outside market hours)
+            # Use type 4 so the bot works after-hours too.
+            self.ib.reqMarketDataType(4)
             logger.info(
                 f"Connected to IBKR TWS at {config.TWS_HOST}:{config.TWS_PORT} "
-                f"(Account: {self.ib.managedAccounts()})"
+                f"(Account: {self.ib.managedAccounts()}) | Market data: DELAYED-FROZEN"
             )
             return True
         except Exception as e:
@@ -103,23 +108,50 @@ class TradingBot:
             logger.info("Disconnected from TWS")
 
     def fetch_underlying_prices(self) -> dict:
-        """Get current prices for all underlyings."""
+        """Get current prices for all underlyings (supports delayed/frozen data)."""
         prices = {}
         for symbol, info in config.UNDERLYINGS.items():
             contract = Stock(symbol, info["exchange"], info["currency"])
             self.ib.qualifyContracts(contract)
-            ticker = self.ib.reqMktData(contract)
-            self.ib.sleep(2)  # Wait for data
+            ticker = self.ib.reqMktData(contract, genericTickList="", snapshot=False)
+            self.ib.sleep(5)  # Delayed data needs more time to arrive
 
-            price = ticker.marketPrice()
+            # Try multiple price sources in order of preference
+            price = None
+            for attr in ["marketPrice", "last", "close", "bid", "ask"]:
+                val = getattr(ticker, attr, None)
+                if callable(val):
+                    val = val()
+                if val is not None and val > 0 and str(val) != "nan":
+                    price = float(val)
+                    break
+
+            # Also check delayed-specific fields
+            if price is None:
+                for field in [ticker.last, ticker.close, ticker.bid, ticker.ask]:
+                    if field is not None and field > 0 and str(field) != "nan":
+                        price = float(field)
+                        break
+
             if price and price > 0:
                 prices[f"{symbol}_price"] = price
                 logger.info(f"{symbol}: ${price:.2f}")
             else:
-                # Fallback to last close
-                price = ticker.close or 0
-                prices[f"{symbol}_price"] = price
-                logger.warning(f"{symbol}: Using close ${price:.2f} (no live data)")
+                logger.warning(
+                    f"{symbol}: No price available (market may be closed). "
+                    f"Ticker fields: last={ticker.last}, close={ticker.close}, "
+                    f"bid={ticker.bid}, ask={ticker.ask}"
+                )
+                # Use hardcoded fallback prices (update these to current levels)
+                # As of March 16, 2026: Gold ~$5,019/oz, Silver ~$80/oz, WTI ~$96/bbl
+                # GLD ≈ gold/10.8, SLV ≈ silver, USO ≈ crude-linked
+                FALLBACK_PRICES = {"SLV": 74.0, "GLD": 465.0, "USO": 85.0}
+                if symbol in FALLBACK_PRICES:
+                    prices[f"{symbol}_price"] = FALLBACK_PRICES[symbol]
+                    logger.warning(
+                        f"{symbol}: Using FALLBACK price ${FALLBACK_PRICES[symbol]:.2f} "
+                        f"— update FALLBACK_PRICES in bot.py if stale!"
+                    )
 
             self.ib.cancelMktData(contract)
 
@@ -129,6 +161,11 @@ class TradingBot:
         """Fetch option chains for greeks-based strike selection."""
         chains = {}
         for symbol in ["SLV", "GLD", "USO"]:
+            price = prices.get(f"{symbol}_price", 0)
+            if not price or price <= 0:
+                logger.warning(f"Skipping {symbol} chain — no valid price")
+                continue
+
             try:
                 contract = Stock(symbol, "ARCA", "USD")
                 self.ib.qualifyContracts(contract)
@@ -136,36 +173,79 @@ class TradingBot:
                     contract.symbol, "", contract.secType, contract.conId
                 )
 
-                if chain_def:
-                    # Find the exchange with our target expiry
+                if not chain_def:
+                    logger.warning(f"{symbol}: No option chain definitions returned")
+                    continue
+
+                # Find the exchange with our target expiry
+                target_cd = None
+                for cd in chain_def:
+                    if config.TARGET_EXPIRY in cd.expirations:
+                        target_cd = cd
+                        break
+
+                # Try backup expiry if primary not found
+                if target_cd is None:
                     for cd in chain_def:
-                        if config.TARGET_EXPIRY in cd.expirations:
-                            # Get a range of strikes around current price
-                            price = prices.get(f"{symbol}_price", 0)
-                            strikes = sorted(
-                                [s for s in cd.strikes if abs(s - price) < price * 0.15]
-                            )
-
-                            # Request market data for these options
-                            option_contracts = []
-                            for strike in strikes:
-                                for right in ["C", "P"]:
-                                    opt = Option(
-                                        symbol, config.TARGET_EXPIRY, strike,
-                                        right, cd.exchange, currency="USD"
-                                    )
-                                    option_contracts.append(opt)
-
-                            qualified = self.ib.qualifyContracts(*option_contracts)
-                            tickers = self.ib.reqTickers(*qualified)
-                            self.ib.sleep(3)
-
-                            chains[f"{symbol}_chains"] = tickers
-                            logger.info(
-                                f"{symbol} chain: {len(tickers)} contracts loaded "
-                                f"({len(strikes)} strikes, expiry {config.TARGET_EXPIRY})"
+                        if config.BACKUP_EXPIRY in cd.expirations:
+                            target_cd = cd
+                            logger.warning(
+                                f"{symbol}: Using BACKUP expiry {config.BACKUP_EXPIRY} "
+                                f"(primary {config.TARGET_EXPIRY} not available)"
                             )
                             break
+
+                if target_cd is None:
+                    # Log what expirations ARE available
+                    all_expiries = set()
+                    for cd in chain_def:
+                        all_expiries.update(cd.expirations)
+                    sorted_exp = sorted(all_expiries)
+                    logger.warning(
+                        f"{symbol}: Neither {config.TARGET_EXPIRY} nor "
+                        f"{config.BACKUP_EXPIRY} found. Available: "
+                        f"{sorted_exp[:10]}..."
+                    )
+                    continue
+
+                expiry = (config.TARGET_EXPIRY
+                          if config.TARGET_EXPIRY in target_cd.expirations
+                          else config.BACKUP_EXPIRY)
+
+                # Get strikes within 15% of current price
+                strikes = sorted(
+                    [s for s in target_cd.strikes
+                     if abs(s - price) < price * 0.15]
+                )
+
+                if not strikes:
+                    logger.warning(f"{symbol}: No strikes near ${price:.2f}")
+                    continue
+
+                logger.info(
+                    f"{symbol}: Found {len(strikes)} strikes near ${price:.2f} "
+                    f"on {target_cd.exchange}, expiry {expiry}"
+                )
+
+                # Request market data for these options
+                option_contracts = []
+                for strike in strikes:
+                    for right in ["C", "P"]:
+                        opt = Option(
+                            symbol, expiry, strike,
+                            right, target_cd.exchange, currency="USD"
+                        )
+                        option_contracts.append(opt)
+
+                if option_contracts:
+                    qualified = self.ib.qualifyContracts(*option_contracts)
+                    if qualified:
+                        tickers = self.ib.reqTickers(*qualified)
+                        self.ib.sleep(5)  # Extra time for delayed data
+                        chains[f"{symbol}_chains"] = tickers
+                        logger.info(
+                            f"{symbol} chain: {len(tickers)} contracts loaded"
+                        )
 
             except Exception as e:
                 logger.warning(f"Could not fetch {symbol} chain: {e}")
@@ -185,9 +265,20 @@ class TradingBot:
         """Get GLD closing price as benchmark."""
         contract = Stock("GLD", "ARCA", "USD")
         self.ib.qualifyContracts(contract)
-        ticker = self.ib.reqMktData(contract)
-        self.ib.sleep(2)
-        price = ticker.marketPrice() or ticker.close or 0
+        ticker = self.ib.reqMktData(contract, genericTickList="", snapshot=False)
+        self.ib.sleep(5)  # Delayed data needs time
+
+        price = None
+        for val in [ticker.last, ticker.close, ticker.bid, ticker.ask]:
+            if val is not None and val > 0 and str(val) != "nan":
+                price = float(val)
+                break
+        if price is None:
+            price = ticker.marketPrice()
+            if price is None or str(price) == "nan":
+                price = 465.0  # Fallback — update if stale
+                logger.warning(f"GLD benchmark: using fallback ${price}")
+
         self.ib.cancelMktData(contract)
         return price
 
